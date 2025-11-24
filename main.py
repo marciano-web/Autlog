@@ -1,62 +1,115 @@
-import os
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from datetime import datetime
+import pytz
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
-from sqlalchemy.orm import sessionmaker, declarative_base
+app = Flask(__name__)
+CORS(app)
 
-# =========================
-# CONFIG DO BANCO
-# =========================
-DATABASE_URL = os.getenv("DATABASE_URL")
+# -------------------------
+# Configuração do Postgres
+# -------------------------
 
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(bind=engine)
+def get_db_connection():
+    return psycopg2.connect(
+        host="containers-us-west-103.railway.app",
+        database="railway",
+        user="postgres",
+        password="YOUR_PASSWORD_HERE",  # <= mantenha seu original
+        port=12345
+    )
 
-Base = declarative_base()
+# -------------------------
+# API ROOT
+# -------------------------
 
-class TemperatureReading(Base):
-    __tablename__ = "temperature_readings"
+@app.route("/")
+def home():
+    return "API ONLINE"
 
-    id = Column(Integer, primary_key=True, index=True)
-    device_id = Column(String, index=True, nullable=False)
-    temperature_c = Column(Float, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+# -------------------------
+# RECEBE DADOS DO LOGGER
+# -------------------------
 
-Base.metadata.create_all(bind=engine)
+@app.route("/api/log", methods=["POST"])
+def receive_log():
 
-# =========================
-# MODELO DE ENTRADA
-# =========================
-class TemperaturePayload(BaseModel):
-    device_id: str
-    temperature_c: float
+    data = request.get_json()
 
-# =========================
-# FASTAPI
-# =========================
-app = FastAPI()
+    device_id = data.get("device_id")
+    temperature_c = data.get("temperature_c")
+    timestamp_str = data.get("timestamp")  # <-- AGORA USADO!
 
-@app.get("/")
-def root():
-    return {"status": "ok"}
+    if not device_id or temperature_c is None or not timestamp_str:
+        return jsonify({"status": "erro", "msg": "dados incompletos"}), 400
 
-@app.post("/api/temperatura")
-def receber_temperatura(payload: TemperaturePayload):
+    # -------------------------
+    # CONVERTE TIMESTAMP
+    # -------------------------
+
     try:
-        db = SessionLocal()
-        leitura = TemperatureReading(
-            device_id=payload.device_id,
-            temperature_c=payload.temperature_c,
-        )
-        db.add(leitura)
-        db.commit()
-        db.refresh(leitura)
-    except Exception as e:
-        print("Erro ao salvar:", e)
-        raise HTTPException(status_code=500, detail="erro ao salvar")
-    finally:
-        db.close()
+        # interpretar como horário LOCAL do Brasil
+        br_tz = pytz.timezone("America/Sao_Paulo")
+        dt_local = br_tz.localize(datetime.fromisoformat(timestamp_str))
 
-    return {"status": "ok", "id": leitura.id}
+        # converter para UTC para salvar corretamente
+        dt_utc = dt_local.astimezone(pytz.UTC)
+
+    except Exception as e:
+        return jsonify({"status": "erro", "msg": f"timestamp inválido: {str(e)}"}), 400
+
+    # -------------------------
+    # SALVA NO BANCO
+    # -------------------------
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    query = """
+    INSERT INTO logs (device_id, temperature_c, measurement_at)
+    VALUES (%s, %s, %s)
+    RETURNING id;
+    """
+
+    cur.execute(query, (device_id, temperature_c, dt_utc))
+    new_id = cur.fetchone()[0]
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return jsonify({"status": "ok", "id": new_id}), 200
+
+
+# -------------------------
+# LISTA LOGS (AJUDA PARA TESTAR)
+# -------------------------
+
+@app.route("/api/list")
+def list_logs():
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    cur.execute("""
+        SELECT id, device_id, temperature_c,
+               measurement_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo' AS measurement_br
+        FROM logs
+        ORDER BY id DESC
+        LIMIT 50;
+    """)
+
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return jsonify(rows)
+
+
+# -------------------------
+# EXECUTAR
+# -------------------------
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
+
